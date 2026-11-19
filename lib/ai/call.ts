@@ -71,6 +71,15 @@ async function logCall(row: AiCallRow): Promise<void> {
   console.info("[ai_calls]", JSON.stringify(row));
 }
 
+/**
+ * Names each call in Langfuse after its feature (for example "ask-copper" or
+ * "refund-agent"), so a trace shows which agent made it. Only sent when
+ * tracing is on (lib/ai/tracing.ts).
+ */
+function telemetryFor(info: Pick<CallInfo, "module" | "feature">) {
+  return { functionId: info.feature };
+}
+
 type Usage = { inputTokens?: number; outputTokens?: number };
 
 /** Builds the ai_calls row for a call that started at `started`. */
@@ -114,7 +123,11 @@ async function tracked<T extends { usage: Usage }>(
 /** Generates text. Example: callText({ module: 3, feature: "support-answer" }, { prompt }) */
 export async function callText(info: CallInfo, options: TextOptions) {
   return tracked(info, (model) =>
-    generateText({ ...options, model: languageModel(model) }),
+    generateText({
+      ...options,
+      model: languageModel(model),
+      telemetry: telemetryFor(info),
+    }),
   );
 }
 
@@ -129,6 +142,7 @@ export async function callObject<Schema extends z.ZodType>(
       ...rest,
       model: languageModel(model),
       output: Output.object({ schema }),
+      telemetry: telemetryFor(info),
     }),
   );
   // Spreading `rest` loses generateText's output type; Output.object has
@@ -165,6 +179,7 @@ export async function callEmbedMany(
       providerOptions: {
         google: { outputDimensionality: EMBEDDING_DIMENSIONS },
       },
+      telemetry: telemetryFor(info),
     });
     await log(true);
     return result;
@@ -190,6 +205,7 @@ export function callStream(info: CallInfo, options: StreamOptions) {
   return streamText({
     ...options,
     model: languageModel(model),
+    telemetry: telemetryFor(info),
     onFinish: ({ totalUsage }) => logCall(row(true, totalUsage)),
     onError: () => logCall(row(false)),
   });

@@ -9,9 +9,14 @@
 // talking. Copper can hand the conversation to the Refund agent, a second
 // agent with its own instructions and tools, and the Refund agent can hand it
 // back. The agent that ends the turn answers the next message too.
+// Module 5: each turn is one Langfuse trace named "ask-copper", with one
+// "agent" section per agent that spoke (Copper, then the Refund agent after a
+// handoff). Each section holds that agent's model calls and tool calls.
+import { propagateAttributes, startActiveObservation } from "@langfuse/tracing";
 import { hasToolCall, stepCountIs } from "ai";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
 import { createLive, type Live } from "@/lib/ai/live";
+import { flushTracing } from "@/lib/ai/tracing";
 import {
   COPPER_HANDOFF,
   COPPER_INSTRUCTIONS,
@@ -60,6 +65,12 @@ const STOP = [
 ];
 
 const SORRY = "Sorry, something went wrong on my end. Please try again.";
+
+/** How each agent is named in Langfuse. */
+const AGENT_TRACE_NAMES: Record<Agent, string> = {
+  copper: "Copper",
+  refund: "Refund agent",
+};
 
 /** One agent's call: its instructions and only its own tools. */
 function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
@@ -190,14 +201,39 @@ export async function askCopper({
     return handoff;
   }
 
+  /** Runs one agent's call inside its own "agent" section of the trace. */
+  const runAgent = (
+    current: Agent,
+    start: () => ReturnType<typeof callStream>,
+  ) =>
+    startActiveObservation(
+      AGENT_TRACE_NAMES[current],
+      async (span) => {
+        const next = await follow(current, start());
+        span.update({ output: { reply: progress.reply, handoffTo: next } });
+        return next;
+      },
+      { asType: "agent" },
+    );
+
+  const question = messages.findLast((m) => m.role === "user")?.content ?? "";
+  const agentsUsed = new Set<Agent>([first]);
+
   // Read the stream in the background, so the panel gets the first update now.
-  void (async () => {
+  void startActiveObservation("ask-copper", (turn) =>
+    propagateAttributes(
+      { traceName: "ask-copper", tags: desk ? ["support-page"] : ["home"] },
+      () => runTurn(turn),
+    ),
+  );
+
+  async function runTurn(turn: { update: (attributes: object) => unknown }) {
+    turn.update({ input: { question, useTools, firstAgent: first } });
     try {
       if (!useTools) {
         // Without tools, send no instructions either: "always use your
         // tools" with no tools makes the model answer with nothing.
-        await follow(
-          "copper",
+        await runAgent("copper", () =>
           callStream(
             { module: 2, feature: "ask-copper" },
             { messages, providerOptions: THOUGHT_SUMMARIES },
@@ -206,13 +242,14 @@ export async function askCopper({
       } else {
         let current = first;
         for (let handoffs = 0; ; handoffs++) {
-          const next = await follow(
-            current,
-            agentCall(current, messages, desk),
+          const speaker: Agent = current;
+          const next = await runAgent(speaker, () =>
+            agentCall(speaker, messages, desk),
           );
           if (!next || next === current || handoffs >= MAX_HANDOFFS) break;
           progress.steps.push({ type: "handoff", from: current, to: next });
           progress.agent = current = next;
+          agentsUsed.add(next);
           progress.reply = "";
           call++;
           update(snapshot());
@@ -224,8 +261,16 @@ export async function askCopper({
       progress.status = "error";
       if (!progress.reply.trim()) progress.reply = SORRY;
     }
+    turn.update({
+      output: {
+        reply: progress.reply,
+        status: progress.status,
+        agents: [...agentsUsed].map((a) => AGENT_TRACE_NAMES[a]),
+      },
+    });
     done(snapshot());
-  })();
+    await flushTracing();
+  }
 
   return { progress: live };
 }

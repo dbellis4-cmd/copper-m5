@@ -183,3 +183,22 @@ through a pull request whose checks all pass.
 Linux job gets it, so the live Gemini test (`tests/ai.integration.test.ts`)
 costs one request per run; on macOS and Windows it skips.
 `tests/ci-workflow.test.ts` fails if a step or the key goes missing.
+
+## Module 5, Part 2: observability (Langfuse)
+
+**Summary:** Every AI call is traced in Langfuse. `instrumentation.ts` calls
+`startTracing()` (`lib/ai/tracing.ts`) when the server starts; it registers
+the AI SDK's OpenTelemetry integration (`@ai-sdk/otel`) and Langfuse's span
+processor (`@langfuse/otel`). Without `LANGFUSE_PUBLIC_KEY`,
+`LANGFUSE_SECRET_KEY` and `LANGFUSE_BASE_URL` nothing is set up.
+
+**What a trace shows:** each Ask Copper turn is one trace named `ask-copper`
+(tagged `home` or `support-page`) with the question as input and the reply as
+output. Inside it is one `agent` section per agent that spoke ("Copper", then
+"Refund agent" after a handoff), each holding its model calls (tokens, model,
+time) and tool calls. `lib/ai/call.ts` names every call after its feature
+(`telemetry.functionId`), so calls outside the chat are labeled too. Each turn
+flushes its trace when it ends.
+
+**Tests:** `tests/tracing.test.ts` collects spans in memory (no keys needed)
+and checks the feature name, tokens and timing.
