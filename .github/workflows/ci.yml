@@ -1,7 +1,10 @@
 name: CI
 
+# Runs on every pull request, and on main after a merge. Not on every branch
+# push too, so each pull request update is checked once, not twice.
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -22,4 +25,8 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
+        env:
+          # The live Gemini test runs on Linux only, to save the free key's
+          # daily requests. On macOS and Windows the key is empty, so it skips.
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ matrix.os == 'ubuntu-latest' && secrets.GOOGLE_GENERATIVE_AI_API_KEY || '' }}
       - run: npm run build

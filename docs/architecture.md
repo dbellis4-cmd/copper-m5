@@ -171,3 +171,15 @@ the tests and a golden-set evaluation with an AI judge run in GitHub Actions
 on every pull request, with `main` protected; every AI call is traced in
 Langfuse; and one support agent that does everything is compared with the two
 agents on the same golden set. Langfuse is the only eval and monitoring tool.
+
+## Module 5, Part 1: tests in CI
+
+**Summary:** `.github/workflows/ci.yml` runs lint, the type check, the tests
+and the build on Linux, macOS and Windows for every pull request and for each
+push to `main`. A ruleset on `main` in the student's repo only lets changes in
+through a pull request whose checks all pass.
+
+**Secrets:** `GOOGLE_GENERATIVE_AI_API_KEY` is an Actions secret. Only the
+Linux job gets it, so the live Gemini test (`tests/ai.integration.test.ts`)
+costs one request per run; on macOS and Windows it skips.
+`tests/ci-workflow.test.ts` fails if a step or the key goes missing.
