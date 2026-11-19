@@ -43,6 +43,8 @@ export type AskCopperRequest = {
   desk?: Desk;
   /** Who answers first: whoever ended the last turn. Copper by default. */
   agent?: Agent;
+  /** Module 5: groups a conversation's turns into one Langfuse session. */
+  sessionId?: string;
 };
 
 export type AskCopperResult = { progress: Live<Progress> };
@@ -65,6 +67,11 @@ const STOP = [
 ];
 
 const SORRY = "Sorry, something went wrong on my end. Please try again.";
+
+/** Langfuse session ids: short plain-ASCII text, or none. */
+function validSessionId(id: string | undefined) {
+  return id && /^[\x20-\x7e]{1,200}$/.test(id) ? id : undefined;
+}
 
 /** How each agent is named in Langfuse. */
 const AGENT_TRACE_NAMES: Record<Agent, string> = {
@@ -106,6 +113,7 @@ export async function askCopper({
   useTools,
   desk,
   agent = "copper",
+  sessionId,
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
   const first: Agent = desk && useTools ? agent : "copper";
@@ -220,15 +228,23 @@ export async function askCopper({
   const agentsUsed = new Set<Agent>([first]);
 
   // Read the stream in the background, so the panel gets the first update now.
+  // Langfuse best practice: one trace per turn, one session per conversation,
+  // the customer's question as the trace input and the reply as its output.
+  // Details a reviewer might filter by go in metadata.
   void startActiveObservation("ask-copper", (turn) =>
     propagateAttributes(
-      { traceName: "ask-copper", tags: desk ? ["support-page"] : ["home"] },
+      {
+        traceName: "ask-copper",
+        sessionId: validSessionId(sessionId),
+        tags: [desk ? "support-page" : "home"],
+        metadata: { useTools: String(useTools), firstAgent: first },
+      },
       () => runTurn(turn),
     ),
   );
 
   async function runTurn(turn: { update: (attributes: object) => unknown }) {
-    turn.update({ input: { question, useTools, firstAgent: first } });
+    turn.update({ input: question });
     try {
       if (!useTools) {
         // Without tools, send no instructions either: "always use your
@@ -262,11 +278,12 @@ export async function askCopper({
       if (!progress.reply.trim()) progress.reply = SORRY;
     }
     turn.update({
-      output: {
-        reply: progress.reply,
+      output: progress.reply,
+      metadata: {
         status: progress.status,
         agents: [...agentsUsed].map((a) => AGENT_TRACE_NAMES[a]),
       },
+      ...(progress.status === "error" && { level: "ERROR" }),
     });
     done(snapshot());
     await flushTracing();

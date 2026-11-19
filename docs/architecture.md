@@ -186,19 +186,32 @@ costs one request per run; on macOS and Windows it skips.
 
 ## Module 5, Part 2: observability (Langfuse)
 
-**Summary:** Every AI call is traced in Langfuse. `instrumentation.ts` calls
+**Summary:** Every AI call is traced in Langfuse, set up with the Langfuse
+agent skill and Langfuse's AI SDK 7 guide. `instrumentation.ts` calls
 `startTracing()` (`lib/ai/tracing.ts`) when the server starts; it registers
-the AI SDK's OpenTelemetry integration (`@ai-sdk/otel`) and Langfuse's span
-processor (`@langfuse/otel`). Without `LANGFUSE_PUBLIC_KEY`,
-`LANGFUSE_SECRET_KEY` and `LANGFUSE_BASE_URL` nothing is set up.
+Langfuse's AI SDK integration (`@langfuse/vercel-ai-sdk`) and span processor
+(`@langfuse/otel`). Without `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and
+`LANGFUSE_BASE_URL` nothing is set up. `@ai-sdk/otel` is pinned to the
+version that matches `ai`, or the two clash.
 
-**What a trace shows:** each Ask Copper turn is one trace named `ask-copper`
-(tagged `home` or `support-page`) with the question as input and the reply as
-output. Inside it is one `agent` section per agent that spoke ("Copper", then
-"Refund agent" after a handoff), each holding its model calls (tokens, model,
-time) and tool calls. `lib/ai/call.ts` names every call after its feature
-(`telemetry.functionId`), so calls outside the chat are labeled too. Each turn
-flushes its trace when it ends.
+**What a trace shows** (following Langfuse's "what does a good trace look
+like" guide):
 
-**Tests:** `tests/tracing.test.ts` collects spans in memory (no keys needed)
-and checks the feature name, tokens and timing.
+- One trace per Ask Copper turn, named `ask-copper`, with the customer's
+  question as input and the reply as output (plain text, readable in the
+  tracing table). Status and the agents that spoke are metadata; a failed
+  turn is marked `ERROR`.
+- One session per conversation: the chat panel makes a `sessionId` for each
+  conversation (with and without tools), so the Sessions view replays it.
+- One `agent` observation per agent that spoke, directly under the turn:
+  "Copper", then "Refund agent" after a handoff. Each holds its model calls
+  (generations with model, tokens, cost, time and thinking) and tool calls.
+- A tag for where the chat ran (`home` or `support-page`).
+- The environment: `LANGFUSE_TRACING_ENVIRONMENT` if set, else Vercel's
+  `VERCEL_ENV`, else `development`, so test traces stay out of production.
+- `lib/ai/call.ts` names every call after its feature (`telemetry.functionId`),
+  so calls outside the chat are labeled too. Each turn flushes its trace.
+
+**Tests:** `tests/tracing.test.ts` runs spans through Langfuse's processor into
+memory (no keys needed) and checks the feature name, tokens and time, the
+trace attributes, the environment, and a full Copper to Refund agent turn.

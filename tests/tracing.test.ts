@@ -1,12 +1,13 @@
 // @vitest-environment node
-import { OpenTelemetry } from "@ai-sdk/otel";
+import type { LanguageModelV4StreamPart } from "@ai-sdk/provider";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
+import { LangfuseVercelAiSdkIntegration } from "@langfuse/vercel-ai-sdk";
 import {
   InMemorySpanExporter,
   NodeTracerProvider,
-  SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-node";
 import { registerTelemetry } from "ai";
-import { MockLanguageModelV4 } from "ai/test";
+import { convertArrayToReadableStream, MockLanguageModelV4 } from "ai/test";
 import {
   afterAll,
   afterEach,
@@ -17,11 +18,15 @@ import {
   it,
   vi,
 } from "vitest";
+import { propagateAttributes } from "@langfuse/tracing";
 import { callText } from "@/lib/ai/call";
+import { finalValue } from "@/lib/ai/live";
+import { askCopper } from "@/lib/copper/assistant/ask";
 import {
   isTracingConfigured,
   LANGFUSE_VARIABLES,
   startTracing,
+  tracingEnvironment,
 } from "@/lib/ai/tracing";
 
 // Module 5, Part 2: every AI call is traced for Langfuse. These tests collect
@@ -34,11 +39,18 @@ vi.mock("@ai-sdk/google", () => ({
 
 const exporter = new InMemorySpanExporter();
 const provider = new NodeTracerProvider({
-  spanProcessors: [new SimpleSpanProcessor(exporter)],
+  spanProcessors: [
+    new LangfuseSpanProcessor({
+      exporter,
+      publicKey: "pk-lf-test",
+      environment: "test",
+      flushAt: 1,
+    }),
+  ],
 });
 beforeAll(() => {
   provider.register();
-  registerTelemetry(new OpenTelemetry());
+  registerTelemetry(new LangfuseVercelAiSdkIntegration());
 });
 afterAll(() => provider.shutdown());
 
@@ -115,5 +127,120 @@ describe("AI calls are traced", () => {
       (s) => s.attributes["gen_ai.agent.name"] === "ask-copper",
     );
     expect(agent).toBeDefined();
+  });
+});
+
+describe("trace attributes", () => {
+  it("files every observation under the trace name, session, tag and environment", async () => {
+    await propagateAttributes(
+      { traceName: "ask-copper", sessionId: "chat-1", tags: ["home"] },
+      () => callText({ module: 2, feature: "ask-copper" }, { prompt: "Hi" }),
+    );
+    await provider.forceFlush();
+
+    for (const span of exporter.getFinishedSpans())
+      expect(span.attributes).toMatchObject({
+        "langfuse.trace.name": "ask-copper",
+        "session.id": "chat-1",
+        "langfuse.trace.tags": ["home"],
+        "langfuse.environment": "test",
+      });
+  });
+
+  it("uses LANGFUSE_TRACING_ENVIRONMENT, then Vercel's environment, then development", () => {
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "");
+    vi.stubEnv("VERCEL_ENV", "");
+    expect(tracingEnvironment()).toBe("development");
+    vi.stubEnv("VERCEL_ENV", "production");
+    expect(tracingEnvironment()).toBe("production");
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "ci");
+    expect(tracingEnvironment()).toBe("ci");
+  });
+});
+
+type StreamPart = Parameters<
+  typeof convertArrayToReadableStream<LanguageModelV4StreamPart>
+>[0][number];
+const finish = (reason: "stop" | "tool-calls"): StreamPart => ({
+  type: "finish",
+  finishReason: { unified: reason, raw: undefined },
+  usage: {
+    inputTokens: {
+      total: 500,
+      noCache: 500,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: { total: 50, text: 50, reasoning: undefined },
+  },
+});
+const says = (text: string): StreamPart[] => [
+  { type: "text-start", id: "t1" },
+  { type: "text-delta", id: "t1", delta: text },
+  { type: "text-end", id: "t1" },
+  finish("stop"),
+];
+const calls = (toolName: string, input: unknown): StreamPart[] => [
+  { type: "tool-input-start", id: "call-1", toolName },
+  { type: "tool-input-end", id: "call-1" },
+  {
+    type: "tool-call",
+    toolCallId: "call-1",
+    toolName,
+    input: JSON.stringify(input),
+  },
+  finish("tool-calls"),
+];
+
+describe("an Ask Copper turn", () => {
+  it("is one trace: the question in, the reply out, one agent section per agent", async () => {
+    const steps = [
+      calls("transfer_to_refund_agent", { reason: "refund order #1004" }),
+      calls("request_refund", { orderId: "1004" }),
+      says("A supervisor needs to approve it."),
+    ];
+    let step = 0;
+    model = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: convertArrayToReadableStream(steps[step++] ?? says("")),
+      }),
+    });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const { progress } = await askCopper({
+      messages: [{ role: "user", content: "Refund order #1004" }],
+      useTools: true,
+      desk: { limitUsd: 50, refunds: [] },
+      sessionId: "chat-42",
+    });
+    await finalValue(progress);
+
+    const named = (name: string) =>
+      exporter.getFinishedSpans().find((s) => s.name === name);
+    await vi.waitFor(async () => {
+      await provider.forceFlush();
+      expect(named("ask-copper")).toBeDefined();
+    });
+    const spans = exporter.getFinishedSpans();
+
+    const turn = named("ask-copper")!;
+    expect(turn.attributes).toMatchObject({
+      "langfuse.observation.input": "Refund order #1004",
+      "langfuse.observation.output": "A supervisor needs to approve it.",
+      "session.id": "chat-42",
+      "langfuse.trace.tags": ["support-page"],
+    });
+    expect(new Set(spans.map((s) => s.spanContext().traceId)).size).toBe(1);
+
+    // Copper, then the Refund agent after the handoff, each as an "agent"
+    // observation directly under the turn.
+    for (const agent of ["Copper", "Refund agent"]) {
+      const span = named(agent);
+      expect(span?.attributes["langfuse.observation.type"]).toBe("agent");
+      expect(span?.parentSpanContext?.spanId).toBe(turn.spanContext().spanId);
+    }
+    // The tool calls are traced too, inside the agent that made them.
+    const refundTool = spans.find((s) => s.name.includes("request_refund"));
+    expect(refundTool).toBeDefined();
   });
 });
