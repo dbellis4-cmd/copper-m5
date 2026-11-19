@@ -10,7 +10,12 @@
 // Setup follows https://langfuse.com/integrations/frameworks/vercel-ai-sdk.
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import { LangfuseVercelAiSdkIntegration } from "@langfuse/vercel-ai-sdk";
-import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import {
+  NodeTracerProvider,
+  type Span,
+  type SpanProcessor,
+} from "@opentelemetry/sdk-trace-node";
 import { registerTelemetry } from "ai";
 
 export const LANGFUSE_VARIABLES = [
@@ -36,6 +41,45 @@ export function tracingEnvironment(): string {
   );
 }
 
+/** How each agent's feature name shows in Langfuse. */
+const AGENT_NAMES: Record<string, string> = {
+  "ask-copper": "Copper",
+  "refund-agent": "Refund agent",
+};
+
+/**
+ * The AI SDK names its steps after the model ("chat gemini-3-flash") or a
+ * counter ("step 1"). Langfuse's best practice is stable, verb-first names
+ * without the model (it's already on each generation), so evaluators and
+ * dashboards keep working when the model changes. This renames each step as
+ * it starts: each agent after its feature, each model call
+ * "generate-response", each loop step "agent-step".
+ */
+export const stableSpanNames: SpanProcessor = {
+  onStart(span: Span) {
+    const attributes = span.attributes;
+    switch (attributes["gen_ai.operation.name"]) {
+      case "invoke_agent": {
+        const agent = String(attributes["gen_ai.agent.name"] ?? "agent");
+        span.updateName(AGENT_NAMES[agent] ?? agent);
+        break;
+      }
+      case "agent_step":
+        span.updateName("agent-step");
+        break;
+      case "chat":
+        span.updateName("generate-response");
+        break;
+      case "embeddings":
+        span.updateName("embed-texts");
+        break;
+    }
+  },
+  onEnd() {},
+  forceFlush: async () => {},
+  shutdown: async () => {},
+};
+
 let processor: LangfuseSpanProcessor | undefined;
 
 /**
@@ -47,7 +91,11 @@ export function startTracing(): boolean {
   if (processor) return true;
   if (!isTracingConfigured()) return false;
   processor = new LangfuseSpanProcessor({ environment: tracingEnvironment() });
-  new NodeTracerProvider({ spanProcessors: [processor] }).register();
+  new NodeTracerProvider({
+    // Shown in Langfuse as the service that sent the trace.
+    resource: resourceFromAttributes({ "service.name": "copper-state-labs" }),
+    spanProcessors: [stableSpanNames, processor],
+  }).register();
   registerTelemetry(new LangfuseVercelAiSdkIntegration());
   return true;
 }

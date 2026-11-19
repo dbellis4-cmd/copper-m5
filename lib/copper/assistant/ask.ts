@@ -9,9 +9,9 @@
 // talking. Copper can hand the conversation to the Refund agent, a second
 // agent with its own instructions and tools, and the Refund agent can hand it
 // back. The agent that ends the turn answers the next message too.
-// Module 5: each turn is one Langfuse trace named "ask-copper", with one
-// "agent" section per agent that spoke (Copper, then the Refund agent after a
-// handoff). Each section holds that agent's model calls and tool calls.
+// Module 5: each turn is one Langfuse trace named "ask-copper". Inside it,
+// each agent that spoke (Copper, then the Refund agent after a handoff) is an
+// "agent" observation holding its model calls and tool calls.
 import { propagateAttributes, startActiveObservation } from "@langfuse/tracing";
 import { hasToolCall, stepCountIs } from "ai";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
@@ -209,20 +209,14 @@ export async function askCopper({
     return handoff;
   }
 
-  /** Runs one agent's call inside its own "agent" section of the trace. */
+  /**
+   * Runs one agent's call. The AI SDK traces it as that agent (named after
+   * its feature in lib/ai/tracing.ts), with its model calls and tool calls.
+   */
   const runAgent = (
     current: Agent,
     start: () => ReturnType<typeof callStream>,
-  ) =>
-    startActiveObservation(
-      AGENT_TRACE_NAMES[current],
-      async (span) => {
-        const next = await follow(current, start());
-        span.update({ output: { reply: progress.reply, handoffTo: next } });
-        return next;
-      },
-      { asType: "agent" },
-    );
+  ) => follow(current, start());
 
   const question = messages.findLast((m) => m.role === "user")?.content ?? "";
   const agentsUsed = new Set<Agent>([first]);

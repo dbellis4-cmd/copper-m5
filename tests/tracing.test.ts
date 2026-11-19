@@ -26,6 +26,7 @@ import {
   isTracingConfigured,
   LANGFUSE_VARIABLES,
   startTracing,
+  stableSpanNames,
   tracingEnvironment,
 } from "@/lib/ai/tracing";
 
@@ -40,6 +41,7 @@ vi.mock("@ai-sdk/google", () => ({
 const exporter = new InMemorySpanExporter();
 const provider = new NodeTracerProvider({
   spanProcessors: [
+    stableSpanNames,
     new LangfuseSpanProcessor({
       exporter,
       publicKey: "pk-lf-test",
@@ -232,16 +234,27 @@ describe("an Ask Copper turn", () => {
     });
     expect(new Set(spans.map((s) => s.spanContext().traceId)).size).toBe(1);
 
-    // Copper, then the Refund agent after the handoff, each as an "agent"
-    // observation directly under the turn.
+    // Copper, then the Refund agent after the handoff: each agent appears
+    // once, directly under the turn (no duplicate wrapper).
     for (const agent of ["Copper", "Refund agent"]) {
-      const span = named(agent);
-      expect(span?.attributes["langfuse.observation.type"]).toBe("agent");
-      expect(span?.parentSpanContext?.spanId).toBe(turn.spanContext().spanId);
+      const agentSpans = spans.filter((s) => s.name === agent);
+      expect(agentSpans).toHaveLength(1);
+      expect(agentSpans[0].attributes["gen_ai.operation.name"]).toBe(
+        "invoke_agent",
+      );
+      expect(agentSpans[0].parentSpanContext?.spanId).toBe(
+        turn.spanContext().spanId,
+      );
     }
     // The tool calls are traced too, inside the agent that made them.
     const refundTool = spans.find((s) => s.name.includes("request_refund"));
     expect(refundTool).toBeDefined();
+
+    // Stable, verb-first names: no model name or step number in any name.
+    const names = spans.map((s) => s.name);
+    expect(names).toContain("generate-response");
+    expect(names).toContain("agent-step");
+    expect(names.filter((n) => /mock-model-id|step \d/.test(n))).toEqual([]);
   });
 
   it("marks a failed turn as an error, with the reason", async () => {

@@ -204,8 +204,14 @@ like" guide):
 - One session per conversation: the chat panel makes a `sessionId` for each
   conversation (with and without tools), so the Sessions view replays it.
 - One `agent` observation per agent that spoke, directly under the turn:
-  "Copper", then "Refund agent" after a handoff. Each holds its model calls
-  (generations with model, tokens, cost, time and thinking) and tool calls.
+  "Copper", then "Refund agent" after a handoff. These are the AI SDK's own
+  agent observations (no duplicate wrapper). Each holds its `agent-step`s,
+  each step a `generate-response` generation (model, tokens, cost, time,
+  thinking) and the tool calls it requested.
+- Stable names: `stableSpanNames` in `lib/ai/tracing.ts` renames the AI SDK's
+  steps as they start, so no name contains the model ("chat gemini-...") or a
+  counter ("step 1"). The model is still on each generation. The service is
+  named `copper-state-labs`.
 - A tag for where the chat ran (`home` or `support-page`).
 - The environment: `LANGFUSE_TRACING_ENVIRONMENT` if set, else Vercel's
   `VERCEL_ENV`, else `development`, so test traces stay out of production.
