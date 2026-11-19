@@ -245,6 +245,7 @@ export async function askCopper({
 
   async function runTurn(turn: { update: (attributes: object) => unknown }) {
     turn.update({ input: question });
+    let failure: string | undefined;
     try {
       if (!useTools) {
         // Without tools, send no instructions either: "always use your
@@ -273,9 +274,13 @@ export async function askCopper({
       }
       progress.status = "done";
       if (!progress.reply.trim()) progress.reply = SORRY;
-    } catch {
+    } catch (error) {
       progress.status = "error";
       if (!progress.reply.trim()) progress.reply = SORRY;
+      // The customer sees "Sorry"; the real reason goes to the server log and
+      // the Langfuse trace, so a failed turn can be debugged.
+      failure = error instanceof Error ? error.message : String(error);
+      console.error("[ask-copper] turn failed:", failure);
     }
     turn.update({
       output: progress.reply,
@@ -283,7 +288,7 @@ export async function askCopper({
         status: progress.status,
         agents: [...agentsUsed].map((a) => AGENT_TRACE_NAMES[a]),
       },
-      ...(progress.status === "error" && { level: "ERROR" }),
+      ...(failure && { level: "ERROR", statusMessage: failure }),
     });
     done(snapshot());
     await flushTracing();

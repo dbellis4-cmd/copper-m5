@@ -243,4 +243,31 @@ describe("an Ask Copper turn", () => {
     const refundTool = spans.find((s) => s.name.includes("request_refund"));
     expect(refundTool).toBeDefined();
   });
+
+  it("marks a failed turn as an error, with the reason", async () => {
+    model = new MockLanguageModelV4({
+      doStream: async () => {
+        throw new Error("You exceeded your current quota");
+      },
+    });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { progress } = await askCopper({
+      messages: [{ role: "user", content: "Hi" }],
+      useTools: true,
+    });
+    expect((await finalValue(progress)).status).toBe("error");
+
+    const turn = () =>
+      exporter.getFinishedSpans().find((s) => s.name === "ask-copper");
+    await vi.waitFor(async () => {
+      await provider.forceFlush();
+      expect(turn()).toBeDefined();
+    });
+    expect(turn()!.attributes["langfuse.observation.level"]).toBe("ERROR");
+    expect(
+      String(turn()!.attributes["langfuse.observation.status_message"]),
+    ).toContain("You exceeded your current quota");
+  });
 });
