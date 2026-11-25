@@ -45,6 +45,7 @@ export function tracingEnvironment(): string {
 const AGENT_NAMES: Record<string, string> = {
   "ask-copper": "Copper",
   "refund-agent": "Refund agent",
+  "support-agent": "Support agent",
 };
 
 /**

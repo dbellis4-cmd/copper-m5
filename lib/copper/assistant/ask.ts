@@ -21,6 +21,7 @@ import {
   COPPER_HANDOFF,
   COPPER_INSTRUCTIONS,
   REFUND_AGENT_INSTRUCTIONS,
+  SUPPORT_AGENT_INSTRUCTIONS,
 } from "@/lib/copper/assistant/instructions";
 import type {
   Agent,
@@ -45,7 +46,15 @@ export type AskCopperRequest = {
   agent?: Agent;
   /** Module 5: groups a conversation's turns into one Langfuse session. */
   sessionId?: string;
+  /**
+   * Module 5, Part 4: "multi" (the default) is Copper plus the Refund agent
+   * with a handoff; "single" is one support agent with all the tools. Only
+   * matters on the Support page (with a desk and tools on).
+   */
+  architecture?: Architecture;
 };
+
+export type Architecture = "multi" | "single";
 
 export type AskCopperResult = { progress: Live<Progress> };
 
@@ -108,12 +117,28 @@ function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
   );
 }
 
+/** Part 4: one support agent with every tool and no handoff. */
+function singleAgentCall(messages: ChatMessage[], desk: Desk) {
+  const { get_orders, request_refund } = refundAgentTools(desk);
+  return callStream(
+    { module: 5, feature: "support-agent" },
+    {
+      messages,
+      providerOptions: THOUGHT_SUMMARIES,
+      instructions: SUPPORT_AGENT_INSTRUCTIONS,
+      tools: { ...copperTools, get_orders, request_refund },
+      stopWhen: stepCountIs(MAX_STEPS),
+    },
+  );
+}
+
 export async function askCopper({
   messages,
   useTools,
   desk,
   agent = "copper",
   sessionId,
+  architecture = "multi",
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
   const first: Agent = desk && useTools ? agent : "copper";
@@ -220,6 +245,7 @@ export async function askCopper({
 
   const question = messages.findLast((m) => m.role === "user")?.content ?? "";
   const agentsUsed = new Set<Agent>([first]);
+  const single = architecture === "single" && Boolean(desk) && useTools;
 
   // Read the stream in the background, so the panel gets the first update now.
   // Langfuse best practice: one trace per turn, one session per conversation,
@@ -231,7 +257,11 @@ export async function askCopper({
         traceName: "ask-copper",
         sessionId: validSessionId(sessionId),
         tags: [desk ? "support-page" : "home"],
-        metadata: { useTools: String(useTools), firstAgent: first },
+        metadata: {
+          useTools: String(useTools),
+          firstAgent: first,
+          architecture: single ? "single" : "multi",
+        },
       },
       () => runTurn(turn),
     ),
@@ -250,6 +280,9 @@ export async function askCopper({
             { messages, providerOptions: THOUGHT_SUMMARIES },
           ),
         );
+      } else if (single && desk) {
+        // Part 4: one support agent answers everything, with no handoff.
+        await runAgent("copper", () => singleAgentCall(messages, desk));
       } else {
         let current = first;
         for (let handoffs = 0; ; handoffs++) {
@@ -280,7 +313,9 @@ export async function askCopper({
       output: progress.reply,
       metadata: {
         status: progress.status,
-        agents: [...agentsUsed].map((a) => AGENT_TRACE_NAMES[a]),
+        agents: single
+          ? ["Support agent"]
+          : [...agentsUsed].map((a) => AGENT_TRACE_NAMES[a]),
       },
       ...(failure && { level: "ERROR", statusMessage: failure }),
     });

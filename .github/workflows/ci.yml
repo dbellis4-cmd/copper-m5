@@ -30,3 +30,32 @@ jobs:
           # daily requests. On macOS and Windows the key is empty, so it skips.
           GOOGLE_GENERATIVE_AI_API_KEY: ${{ matrix.os == 'ubuntu-latest' && secrets.GOOGLE_GENERATIVE_AI_API_KEY || '' }}
       - run: npm run build
+
+  # Module 5, Part 3: the golden-set eval with an AI judge, on every pull
+  # request. Scores go to Langfuse and to this check's summary; the job fails
+  # (and blocks the merge) when the pass rate is below the gate in evals/run.ts.
+  # It runs after the checks pass, so a broken change doesn't spend the free
+  # Gemini key's requests.
+  evals:
+    if: github.event_name == 'pull_request'
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # A newer push to the same pull request cancels the older eval run.
+    concurrency:
+      group: evals-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run eval
+        env:
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com' }}
+          LANGFUSE_TRACING_ENVIRONMENT: ci

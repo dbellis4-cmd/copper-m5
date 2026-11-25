@@ -242,3 +242,51 @@ describe("Refund Console", () => {
     ).toBeVisible();
   });
 });
+
+describe("the single support agent (Module 5, Part 4)", () => {
+  it("refunds with one agent, every tool and no handoff", async () => {
+    model = modelStreaming(
+      calls("request_refund", { orderId: "1001" }),
+      says("Your $7.99 is refunded to your original payment."),
+    );
+    const result = await ask({
+      messages: [{ role: "user", content: "Refund my monthly plan" }],
+      useTools: true,
+      desk: desk(50),
+      architecture: "single",
+    });
+    expect(result.status).toBe("done");
+    expect(result.steps.some((s) => s.type === "handoff")).toBe(false);
+    expect(toolCallsOf(result)[0].output).toMatchObject({
+      status: "refunded",
+      amountUsd: 7.99,
+    });
+    // One agent: its own instructions, Copper's tools plus the refund tools,
+    // and no transfer tools.
+    const first = model.doStreamCalls[0];
+    expect(JSON.stringify(first.prompt)).toContain(
+      "You also handle refunds yourself",
+    );
+    expect(first.tools?.map((t) => t.name).sort()).toEqual([
+      "calculate_cost",
+      "check_availability",
+      "get_orders",
+      "get_prices",
+      "get_products",
+      "request_refund",
+      "search_docs",
+    ]);
+  });
+
+  it("is multi-agent unless asked, so the app itself is unchanged", async () => {
+    model = modelStreaming(says("Hi!"));
+    await ask({
+      messages: [{ role: "user", content: "Hi" }],
+      useTools: true,
+      desk: desk(50),
+    });
+    expect(model.doStreamCalls[0].tools?.map((t) => t.name)).toContain(
+      "transfer_to_refund_agent",
+    );
+  });
+});

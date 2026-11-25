@@ -221,3 +221,42 @@ like" guide):
 **Tests:** `tests/tracing.test.ts` runs spans through Langfuse's processor into
 memory (no keys needed) and checks the feature name, tokens and time, the
 trace attributes, the environment, and a full Copper to Refund agent turn.
+
+## Module 5, Parts 3 and 4: evals with an AI judge, single vs multi agent
+
+**Summary:** `npm run eval` (`evals/run.ts`) runs the golden set
+(`evals/golden-set.ts`, 8 Support-page cases) against Ask Copper as a Langfuse
+experiment on the dataset `ask-copper-golden-set`, which it creates and keeps
+in sync (items are upserted by id). Each reply is graded two ways:
+
+- **AI judge** (`meets_criteria`): Gemini, through `callObject` in
+  `lib/ai/call.ts` (feature `eval-judge`), reads the customer's message, what
+  a good answer does, the tools the agent called with their results, and the
+  reply, then gives a reason and pass or fail.
+- **Refund check** (`refund_decision`, code): for refund cases, the app's
+  `request_refund` result must be the expected status for the expected order,
+  and nothing else may be refunded.
+
+A case `passed` when the turn finished and every check passed. Each run also
+gets `pass_rate`, `avg_agent_cost_usd` and `avg_latency_s` (the agent's own
+model calls, not the judge's). Evals use the default model (Gemini 3.5
+Flash-Lite, or `EVAL_MODEL`), a fresh $50-limit Refund Console per case, one
+case at a time with a pause, and a retry after a minute when Gemini's
+per-minute limit cuts a turn short. The scoring is plain functions in
+`evals/scoring.ts`, tested in `tests/evals.test.ts`, which also checks the
+golden set against the app's own refund rule and prices.
+
+**CI:** the `evals` job in `.github/workflows/ci.yml` runs `npm run eval` on
+every pull request after the checks pass, with `GOOGLE_GENERATIVE_AI_API_KEY`,
+`LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` from Actions secrets. The
+report (pass rate, cost and time, and each case with the judge's reason) goes
+to the check's summary, with a notice on the check, and the job fails below
+the gate (pass rate 75%, `--threshold` or `EVAL_THRESHOLD`). The `main`
+ruleset requires it, so a pull request whose evals fail can't merge.
+
+**Part 4, single agent:** `askCopper({ architecture: "single" })` runs one
+"Support agent" (`SUPPORT_AGENT_INSTRUCTIONS`, feature `support-agent`) with
+Copper's tools plus `get_orders` and `request_refund`, and no handoff. The
+default, `"multi"`, is the app as shipped. `npm run eval -- --agents=both`
+runs the golden set on both; compare the two runs in Langfuse under Datasets >
+`ask-copper-golden-set`.
