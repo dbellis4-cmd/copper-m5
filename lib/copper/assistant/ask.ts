@@ -9,13 +9,19 @@
 // talking. Copper can hand the conversation to the Refund agent, a second
 // agent with its own instructions and tools, and the Refund agent can hand it
 // back. The agent that ends the turn answers the next message too.
+// Module 5: each turn is one Langfuse trace named "ask-copper". Inside it,
+// each agent that spoke (Copper, then the Refund agent after a handoff) is an
+// "agent" observation holding its model calls and tool calls.
+import { propagateAttributes, startActiveObservation } from "@langfuse/tracing";
 import { hasToolCall, stepCountIs } from "ai";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
 import { createLive, type Live } from "@/lib/ai/live";
+import { flushTracing } from "@/lib/ai/tracing";
 import {
   COPPER_HANDOFF,
   COPPER_INSTRUCTIONS,
   REFUND_AGENT_INSTRUCTIONS,
+  SUPPORT_AGENT_INSTRUCTIONS,
 } from "@/lib/copper/assistant/instructions";
 import type {
   Agent,
@@ -38,7 +44,17 @@ export type AskCopperRequest = {
   desk?: Desk;
   /** Who answers first: whoever ended the last turn. Copper by default. */
   agent?: Agent;
+  /** Module 5: groups a conversation's turns into one Langfuse session. */
+  sessionId?: string;
+  /**
+   * Module 5, Part 4: "multi" (the default) is Copper plus the Refund agent
+   * with a handoff; "single" is one support agent with all the tools. Only
+   * matters on the Support page (with a desk and tools on).
+   */
+  architecture?: Architecture;
 };
+
+export type Architecture = "multi" | "single";
 
 export type AskCopperResult = { progress: Live<Progress> };
 
@@ -60,6 +76,17 @@ const STOP = [
 ];
 
 const SORRY = "Sorry, something went wrong on my end. Please try again.";
+
+/** Langfuse session ids: short plain-ASCII text, or none. */
+function validSessionId(id: string | undefined) {
+  return id && /^[\x20-\x7e]{1,200}$/.test(id) ? id : undefined;
+}
+
+/** How each agent is named in Langfuse. */
+const AGENT_TRACE_NAMES: Record<Agent, string> = {
+  copper: "Copper",
+  refund: "Refund agent",
+};
 
 /** One agent's call: its instructions and only its own tools. */
 function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
@@ -90,11 +117,28 @@ function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
   );
 }
 
+/** Part 4: one support agent with every tool and no handoff. */
+function singleAgentCall(messages: ChatMessage[], desk: Desk) {
+  const { get_orders, request_refund } = refundAgentTools(desk);
+  return callStream(
+    { module: 5, feature: "support-agent" },
+    {
+      messages,
+      providerOptions: THOUGHT_SUMMARIES,
+      instructions: SUPPORT_AGENT_INSTRUCTIONS,
+      tools: { ...copperTools, get_orders, request_refund },
+      stopWhen: stepCountIs(MAX_STEPS),
+    },
+  );
+}
+
 export async function askCopper({
   messages,
   useTools,
   desk,
   agent = "copper",
+  sessionId,
+  architecture = "multi",
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
   const first: Agent = desk && useTools ? agent : "copper";
@@ -190,29 +234,66 @@ export async function askCopper({
     return handoff;
   }
 
+  /**
+   * Runs one agent's call. The AI SDK traces it as that agent (named after
+   * its feature in lib/ai/tracing.ts), with its model calls and tool calls.
+   */
+  const runAgent = (
+    current: Agent,
+    start: () => ReturnType<typeof callStream>,
+  ) => follow(current, start());
+
+  const question = messages.findLast((m) => m.role === "user")?.content ?? "";
+  const agentsUsed = new Set<Agent>([first]);
+  const single = architecture === "single" && Boolean(desk) && useTools;
+
   // Read the stream in the background, so the panel gets the first update now.
-  void (async () => {
+  // Langfuse best practice: one trace per turn, one session per conversation,
+  // the customer's question as the trace input and the reply as its output.
+  // Details a reviewer might filter by go in metadata.
+  void startActiveObservation("ask-copper", (turn) =>
+    propagateAttributes(
+      {
+        traceName: "ask-copper",
+        sessionId: validSessionId(sessionId),
+        tags: [desk ? "support-page" : "home"],
+        metadata: {
+          useTools: String(useTools),
+          firstAgent: first,
+          architecture: single ? "single" : "multi",
+        },
+      },
+      () => runTurn(turn),
+    ),
+  );
+
+  async function runTurn(turn: { update: (attributes: object) => unknown }) {
+    turn.update({ input: question });
+    let failure: string | undefined;
     try {
       if (!useTools) {
         // Without tools, send no instructions either: "always use your
         // tools" with no tools makes the model answer with nothing.
-        await follow(
-          "copper",
+        await runAgent("copper", () =>
           callStream(
             { module: 2, feature: "ask-copper" },
             { messages, providerOptions: THOUGHT_SUMMARIES },
           ),
         );
+      } else if (single && desk) {
+        // Part 4: one support agent answers everything, with no handoff.
+        await runAgent("copper", () => singleAgentCall(messages, desk));
       } else {
         let current = first;
         for (let handoffs = 0; ; handoffs++) {
-          const next = await follow(
-            current,
-            agentCall(current, messages, desk),
+          const speaker: Agent = current;
+          const next = await runAgent(speaker, () =>
+            agentCall(speaker, messages, desk),
           );
           if (!next || next === current || handoffs >= MAX_HANDOFFS) break;
           progress.steps.push({ type: "handoff", from: current, to: next });
           progress.agent = current = next;
+          agentsUsed.add(next);
           progress.reply = "";
           call++;
           update(snapshot());
@@ -220,12 +301,27 @@ export async function askCopper({
       }
       progress.status = "done";
       if (!progress.reply.trim()) progress.reply = SORRY;
-    } catch {
+    } catch (error) {
       progress.status = "error";
       if (!progress.reply.trim()) progress.reply = SORRY;
+      // The customer sees "Sorry"; the real reason goes to the server log and
+      // the Langfuse trace, so a failed turn can be debugged.
+      failure = error instanceof Error ? error.message : String(error);
+      console.error("[ask-copper] turn failed:", failure);
     }
+    turn.update({
+      output: progress.reply,
+      metadata: {
+        status: progress.status,
+        agents: single
+          ? ["Support agent"]
+          : [...agentsUsed].map((a) => AGENT_TRACE_NAMES[a]),
+      },
+      ...(failure && { level: "ERROR", statusMessage: failure }),
+    });
     done(snapshot());
-  })();
+    await flushTracing();
+  }
 
   return { progress: live };
 }

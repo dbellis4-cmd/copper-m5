@@ -36,3 +36,23 @@ describe("CI workflow", () => {
     );
   });
 });
+
+describe("CI evals (Module 5, Part 3)", () => {
+  const evals = workflow.slice(workflow.indexOf("\n  evals:"));
+
+  it("runs the golden-set eval on pull requests, after the checks pass", () => {
+    expect(evals).toContain("if: github.event_name == 'pull_request'");
+    expect(evals).toContain("needs: check");
+    expect(evals).toContain("- run: npm run eval");
+  });
+
+  it("gets the Gemini and Langfuse keys from Actions secrets", () => {
+    for (const name of [
+      "GOOGLE_GENERATIVE_AI_API_KEY",
+      "LANGFUSE_PUBLIC_KEY",
+      "LANGFUSE_SECRET_KEY",
+    ])
+      expect(evals).toContain(`${name}: \${{ secrets.${name} }}`);
+    expect(evals).toContain("LANGFUSE_TRACING_ENVIRONMENT: ci");
+  });
+});

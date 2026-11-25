@@ -183,3 +183,80 @@ through a pull request whose checks all pass.
 Linux job gets it, so the live Gemini test (`tests/ai.integration.test.ts`)
 costs one request per run; on macOS and Windows it skips.
 `tests/ci-workflow.test.ts` fails if a step or the key goes missing.
+
+## Module 5, Part 2: observability (Langfuse)
+
+**Summary:** Every AI call is traced in Langfuse, set up with the Langfuse
+agent skill and Langfuse's AI SDK 7 guide. `instrumentation.ts` calls
+`startTracing()` (`lib/ai/tracing.ts`) when the server starts; it registers
+Langfuse's AI SDK integration (`@langfuse/vercel-ai-sdk`) and span processor
+(`@langfuse/otel`). Without `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and
+`LANGFUSE_BASE_URL` nothing is set up. `@ai-sdk/otel` is pinned to the
+version that matches `ai`, or the two clash.
+
+**What a trace shows** (following Langfuse's "what does a good trace look
+like" guide):
+
+- One trace per Ask Copper turn, named `ask-copper`, with the customer's
+  question as input and the reply as output (plain text, readable in the
+  tracing table). Status and the agents that spoke are metadata; a failed
+  turn is marked `ERROR`.
+- One session per conversation: the chat panel makes a `sessionId` for each
+  conversation (with and without tools), so the Sessions view replays it.
+- One `agent` observation per agent that spoke, directly under the turn:
+  "Copper", then "Refund agent" after a handoff. These are the AI SDK's own
+  agent observations (no duplicate wrapper). Each holds its `agent-step`s,
+  each step a `generate-response` generation (model, tokens, cost, time,
+  thinking) and the tool calls it requested.
+- Stable names: `stableSpanNames` in `lib/ai/tracing.ts` renames the AI SDK's
+  steps as they start, so no name contains the model ("chat gemini-...") or a
+  counter ("step 1"). The model is still on each generation. The service is
+  named `copper-state-labs`.
+- A tag for where the chat ran (`home` or `support-page`).
+- The environment: `LANGFUSE_TRACING_ENVIRONMENT` if set, else Vercel's
+  `VERCEL_ENV`, else `development`, so test traces stay out of production.
+- `lib/ai/call.ts` names every call after its feature (`telemetry.functionId`),
+  so calls outside the chat are labeled too. Each turn flushes its trace.
+
+**Tests:** `tests/tracing.test.ts` runs spans through Langfuse's processor into
+memory (no keys needed) and checks the feature name, tokens and time, the
+trace attributes, the environment, and a full Copper to Refund agent turn.
+
+## Module 5, Parts 3 and 4: evals with an AI judge, single vs multi agent
+
+**Summary:** `npm run eval` (`evals/run.ts`) runs the golden set
+(`evals/golden-set.ts`, 8 Support-page cases) against Ask Copper as a Langfuse
+experiment on the dataset `ask-copper-golden-set`, which it creates and keeps
+in sync (items are upserted by id). Each reply is graded two ways:
+
+- **AI judge** (`meets_criteria`): Gemini, through `callObject` in
+  `lib/ai/call.ts` (feature `eval-judge`), reads the customer's message, what
+  a good answer does, the tools the agent called with their results, and the
+  reply, then gives a reason and pass or fail.
+- **Refund check** (`refund_decision`, code): for refund cases, the app's
+  `request_refund` result must be the expected status for the expected order,
+  and nothing else may be refunded.
+
+A case `passed` when the turn finished and every check passed. Each run also
+gets `pass_rate`, `avg_agent_cost_usd` and `avg_latency_s` (the agent's own
+model calls, not the judge's). Evals use the default model (Gemini 3.5
+Flash-Lite, or `EVAL_MODEL`), a fresh $50-limit Refund Console per case, one
+case at a time with a pause, and a retry after a minute when Gemini's
+per-minute limit cuts a turn short. The scoring is plain functions in
+`evals/scoring.ts`, tested in `tests/evals.test.ts`, which also checks the
+golden set against the app's own refund rule and prices.
+
+**CI:** the `evals` job in `.github/workflows/ci.yml` runs `npm run eval` on
+every pull request after the checks pass, with `GOOGLE_GENERATIVE_AI_API_KEY`,
+`LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` from Actions secrets. The
+report (pass rate, cost and time, and each case with the judge's reason) goes
+to the check's summary, with a notice on the check, and the job fails below
+the gate (pass rate 75%, `--threshold` or `EVAL_THRESHOLD`). The `main`
+ruleset requires it, so a pull request whose evals fail can't merge.
+
+**Part 4, single agent:** `askCopper({ architecture: "single" })` runs one
+"Support agent" (`SUPPORT_AGENT_INSTRUCTIONS`, feature `support-agent`) with
+Copper's tools plus `get_orders` and `request_refund`, and no handoff. The
+default, `"multi"`, is the app as shipped. `npm run eval -- --agents=both`
+runs the golden set on both; compare the two runs in Langfuse under Datasets >
+`ask-copper-golden-set`.
